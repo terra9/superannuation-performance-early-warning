@@ -1,0 +1,42 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+
+# Data files (keep directory placeholders)
+data/raw/**
+!data/raw/.gitkeep
+data/interim/**
+!data/interim/.gitkeep
+data/processed/**
+!data/processed/.gitkeep
+
+# Model artefacts
+models/
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.onnx
+
+# Operating-system temporary files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
