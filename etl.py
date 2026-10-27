@@ -12,6 +12,13 @@ from transform import (
 from transform import merge_performance_and_saa, build_model_base
 from transform import select_mysuper_population
 from transform import add_future_4q_returns, add_peer_relative_target
+from transform import (
+    add_historical_return_features,
+    add_current_peer_features,
+)
+from transform import add_volatility_and_strategy_features
+from transform import validate_model_features
+
 
 # Locate the project folder containing this script.
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -156,6 +163,42 @@ def main() -> None:
     hist_model_mysuper_target_peer = add_peer_relative_target(
         hist_model_mysuper_target
     )
+
+    # Construct historical predictors from the complete MySuper history.
+    hist_model_mysuper_features = add_historical_return_features(
+        hist_model_mysuper_target_peer
+    )
+
+    # Add current-quarter peer comparisons.
+    hist_model_mysuper_features = add_current_peer_features(
+        hist_model_mysuper_features
+    )
+
+    # Complete the remaining predictors using the existing dataframe.
+    hist_model_mysuper_features = add_volatility_and_strategy_features(
+        hist_model_mysuper_features
+    )
+
+    # STEP 23: Validate and save the complete prepared dataset.
+    validate_model_features(hist_model_mysuper_features)
+
+    # Reuse the existing processed-data folder.
+    processed_dir = PROJECT_ROOT / "data" / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    # Include the selected edition in the filename.
+    output_path = (
+        processed_dir
+        / f"hist_model_mysuper_features_{args.edition}.parquet"
+    )
+
+    # Preserve identifiers, all engineered columns, targets and unavailable-target rows.
+    hist_model_mysuper_features.to_parquet(
+        output_path,
+        index=False,
+    )
+
+    print(f"Prepared dataset saved: {output_path}")
 
     # --------------------------------------------------
 if __name__ == "__main__":

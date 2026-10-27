@@ -1369,3 +1369,365 @@ def add_peer_relative_target(hist_model_mysuper_target):
     )
 
     return target_data
+
+
+# Construct historical return predictors using the notebook's definitions.
+def add_historical_return_features(data):
+    return_column = "return_measurement_comparison_percent"
+    model_grain = ENTITY_KEYS + ["period_end_date"]
+
+    check_columns(
+        data,
+        model_grain + [return_column],
+        "MySuper feature input",
+    )
+    if data.duplicated(subset=model_grain).any():
+        raise ValueError(
+            "Return features require one row per modelling key."
+        )
+
+    # Keep every row and arrange each entity's history chronologically.
+    features = (
+        data.copy()
+        .sort_values(model_grain, kind="stable")
+        .reset_index(drop=True)
+    )
+    grouped_returns = features.groupby(
+        ENTITY_KEYS, dropna=False
+    )[return_column]
+
+    # Create the lags that the notebook checks against calendar quarters.
+    for lag in [1, 2, 4]:
+        features[f"return_lag_{lag}q"] = grouped_returns.shift(lag)
+
+    features["quarter"] = features["period_end_date"].dt.to_period("Q")
+    grouped_quarters = features.groupby(
+        ENTITY_KEYS, dropna=False
+    )["quarter"]
+
+    # Preserve the quarter diagnostics and mask misaligned lags.
+    for lag in [1, 2, 4]:
+        features[f"quarter_lag_{lag}q"] = grouped_quarters.shift(lag)
+
+        valid = features[f"quarter_lag_{lag}q"].eq(
+            features["quarter"] - lag
+        )
+        features[f"return_lag_{lag}q_valid"] = valid
+        features.loc[~valid, f"return_lag_{lag}q"] = np.nan
+
+    # Calculate return change after checking the one-quarter lag.
+    features["return_change_1q"] = (
+        features[return_column] - features["return_lag_1q"]
+    )
+
+    # Preserve the notebook's three-observed-row lag without a calendar mask.
+    features["return_lag_3q"] = grouped_returns.shift(3)
+
+    # Compound the current return and the preceding three lagged returns.
+    features["return_trailing_4q"] = (
+        (1 + features[return_column])
+        * (1 + features["return_lag_1q"])
+        * (1 + features["return_lag_2q"])
+        * (1 + features["return_lag_3q"])
+        - 1
+    )
+
+    # Rolling summaries require four observed returns, including the current row.
+    rolling = grouped_returns.rolling(window=4, min_periods=4)
+
+    features["return_mean_4q"] = (
+        rolling.mean().reset_index(level=ENTITY_KEYS, drop=True)
+    )
+    features["return_std_4q"] = (
+        rolling.std(ddof=1).reset_index(level=ENTITY_KEYS, drop=True)
+    )
+    features["return_min_4q"] = (
+        rolling.min().reset_index(level=ENTITY_KEYS, drop=True)
+    )
+    features["positive_quarter_share_4q"] = (
+        rolling.apply(
+            lambda values: (values > 0).mean(),
+            raw=True,
+        )
+        .reset_index(level=ENTITY_KEYS, drop=True)
+    )
+
+    # Report rolling windows that span more than four calendar quarters.
+    # Retain the trained definitions rather than silently changing their values.
+    gapped_windows = (
+        features["return_mean_4q"].notna()
+        & grouped_quarters.shift(3).ne(features["quarter"] - 3)
+    ).sum()
+
+    if gapped_windows:
+        print(
+            f"Return history: {gapped_windows:,} complete four-observation "
+            "windows span more than four calendar quarters; "
+            "notebook definitions retained."
+        )
+
+    print(
+        f"Historical return predictors added: "
+        f"all {len(features):,} rows retained."
+    )
+    return features
+
+
+# Construct same-quarter peer predictors using distinct options.
+def add_current_peer_features(data):
+    peer_keys = [
+        "rse_abn",
+        "abn_investment_option_identifier",
+        "period_end_date",
+    ]
+    return_column = "return_measurement_comparison_percent"
+    peer_features = [
+        "current_return_minus_peer_median",
+        "current_return_peer_percentile",
+    ]
+
+    check_columns(
+        data,
+        peer_keys + [return_column],
+        "MySuper feature input",
+    )
+    if set(peer_features) & set(data.columns):
+        raise ValueError(
+            "Current peer features already exist; "
+            "use the preceding-stage data."
+        )
+
+    # Use the median across representations, matching the notebook.
+    peer_returns = data.groupby(
+        peer_keys, as_index=False
+    ).agg(
+        current_return_peer_value=(return_column, "median")
+    )
+
+    # Each option contributes once to the quarter's benchmark and ranking.
+    quarterly_returns = peer_returns.groupby(
+        "period_end_date"
+    )["current_return_peer_value"]
+
+    peer_returns["current_return_peer_median"] = (
+        quarterly_returns.transform("median")
+    )
+    peer_returns["current_return_minus_peer_median"] = (
+        peer_returns["current_return_peer_value"]
+        - peer_returns["current_return_peer_median"]
+    )
+    peer_returns["current_return_peer_percentile"] = (
+        quarterly_returns.rank(pct=True, method="average")
+    )
+
+    # Attach predictors to every representation, including target-unavailable rows.
+    features = data.merge(
+        peer_returns[peer_keys + peer_features],
+        on=peer_keys,
+        how="left",
+        validate="many_to_one",
+        sort=False,
+    )
+
+    print(
+        f"Current peer predictors added: "
+        f"all {len(features):,} rows retained."
+    )
+    return features
+
+# Complete volatility, SAA missingness and strategy-change fields.
+def add_volatility_and_strategy_features(data):
+    metric_5y = (
+        "return_investment_five_year_volatility_comparison_percent"
+    )
+    metric_10y = (
+        "return_investment_ten_year_volatility_comparison_percent_clean"
+    )
+    model_grain = ENTITY_KEYS + ["period_end_date"]
+
+    required = model_grain + [
+        metric_5y,
+        metric_10y,
+        "strategic_growth_allocation",
+        "allocation_equity",
+        "allocation_cash",
+    ]
+    check_columns(data, required, "MySuper feature input")
+
+    if data.duplicated(subset=model_grain).any():
+        raise ValueError(
+            "Strategy features require one row per modelling key."
+        )
+
+    # Keep every row and arrange each entity's history chronologically.
+    features = (
+        data.copy()
+        .sort_values(model_grain, kind="stable")
+        .reset_index(drop=True)
+    )
+
+    # Compare medium-term and longer-term volatility.
+    # Existing volatility missingness flags remain unchanged.
+    features["volatility_5y_minus_10y"] = (
+        features[metric_5y] - features[metric_10y]
+    )
+
+    # Preserve both missingness fields from the notebook.
+    # Only saa_missing is included in the established 33 predictors.
+    features["strategic_growth_missing"] = (
+        features["strategic_growth_allocation"].isna()
+    )
+    features["saa_missing"] = (
+        features["allocation_equity"].isna()
+    )
+
+    # Compare against the previous observed row for the same entity.
+    # Match the notebook without introducing another calendar-quarter mask.
+    grouped = features.groupby(ENTITY_KEYS, dropna=False)
+
+    features["strategic_growth_lag_1q"] = (
+        grouped["strategic_growth_allocation"].shift(1)
+    )
+    features["strategic_growth_change_1q"] = (
+        features["strategic_growth_allocation"]
+        - features["strategic_growth_lag_1q"]
+    )
+
+    # Calculate equity and cash changes using the same definition.
+    for column, feature_name in [
+        ("allocation_equity", "equity_allocation_change_1q"),
+        ("allocation_cash", "cash_allocation_change_1q"),
+    ]:
+        features[feature_name] = (
+            features[column] - grouped[column].shift(1)
+        )
+
+    print(
+        "Volatility, missingness and strategy-change fields added: "
+        f"all {len(features):,} rows retained."
+    )
+    return features
+
+
+# Define predictors in the established modelling order.
+FULL_FEATURE_COLS = [
+    # Historical and peer-relative returns: 13.
+    "return_measurement_comparison_percent",
+    "return_lag_1q",
+    "return_lag_2q",
+    "return_lag_3q",
+    "return_lag_4q",
+    "return_change_1q",
+    "return_trailing_4q",
+    "return_mean_4q",
+    "return_std_4q",
+    "return_min_4q",
+    "positive_quarter_share_4q",
+    "current_return_minus_peer_median",
+    "current_return_peer_percentile",
+
+    # Volatility: 5.
+    "return_investment_five_year_volatility_comparison_percent",
+    "return_investment_ten_year_volatility_comparison_percent_clean",
+    "volatility_5y_minus_10y",
+    "volatility_5y_missing",
+    "volatility_10y_missing",
+
+    # Strategic asset allocation: 9.
+    "strategic_growth_allocation",
+    "allocation_equity",
+    "allocation_property",
+    "allocation_infrastructure",
+    "allocation_cash",
+    "allocation_alternatives",
+    "allocation_credit",
+    "allocation_fixed_income_excluding_credit",
+    "saa_missing",
+
+    # Currency hedging: 3.
+    "weighted_currency_hedging_ratio",
+    "currency_hedging_applicable_allocation",
+    "currency_hedging_distinct_ratios",
+
+    # Strategy changes: 3.
+    "strategic_growth_change_1q",
+    "equity_allocation_change_1q",
+    "cash_allocation_change_1q",
+]
+
+# Preserve the user-selected four-feature omission.
+REDUCED_OMITTED_FEATURES = [
+    "current_return_minus_peer_median",
+    "return_trailing_4q",
+    "return_min_4q",
+    "return_std_4q",
+]
+
+REDUCED_FEATURE_COLS = [
+    column
+    for column in FULL_FEATURE_COLS
+    if column not in REDUCED_OMITTED_FEATURES
+]
+
+# Validate prepared features without filtering rows or filling missing values.
+def validate_model_features(data):
+    model_grain = ENTITY_KEYS + ["period_end_date"]
+
+    # Check the feature specifications.
+    if len(FULL_FEATURE_COLS) != 33 or len(set(FULL_FEATURE_COLS)) != 33:
+        raise ValueError(
+            "The full predictor list must contain 33 distinct columns."
+        )
+
+    if len(REDUCED_FEATURE_COLS) != 29:
+        raise ValueError(
+            "The reduced predictor list must contain 29 columns."
+        )
+
+    check_columns(
+        data,
+        model_grain + FULL_FEATURE_COLS,
+        "Prepared MySuper features",
+    )
+
+    # Check that observations exist at the established modelling grain.
+    if data.empty:
+        raise ValueError("The prepared feature dataset is empty.")
+
+    if data.duplicated(subset=model_grain).any():
+        raise ValueError(
+            "The prepared dataset has duplicate modelling keys."
+        )
+
+    # Numeric and Boolean predictors are accepted.
+    nonnumeric = [
+        column
+        for column in FULL_FEATURE_COLS
+        if not pd.api.types.is_numeric_dtype(data[column].dtype)
+    ]
+
+    if nonnumeric:
+        raise ValueError(
+            f"Nonnumeric predictors found: {nonnumeric}"
+        )
+
+    # Check a temporary array, leaving the original dataframe unchanged.
+    # Missing values are allowed; positive/negative infinity requires review.
+    values = data[FULL_FEATURE_COLS].to_numpy(
+        dtype=float,
+        na_value=np.nan,
+    )
+    infinite_columns = np.array(FULL_FEATURE_COLS)[
+        np.isinf(values).any(axis=0)
+    ].tolist()
+
+    if infinite_columns:
+        raise ValueError(
+            f"Infinite predictor values found: {infinite_columns}"
+        )
+
+    print(
+        f"Feature validation passed: {len(data):,} rows; "
+        "33 reference predictors and 29 selected predictors. "
+        "Missing values retained."
+    )
