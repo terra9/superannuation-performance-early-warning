@@ -1,6 +1,19 @@
 """First transformation stage: validate columns and convert dates/numbers."""
 import pandas as pd
 
+# Define the same entity keys and key order as the notebooks.
+ENTITY_KEYS = [
+    "rse_abn",
+    "abn_product_identifier",
+    "abn_investment_menu_identifier",
+    "abn_investment_option_identifier",
+]
+
+SAA_ENTITY_KEYS = [
+    "rse_abn",
+    "investment_option_identifier",
+]
+
 # Define needed columns
 # Additional source columns will also be retained.
 PERFORMANCE_NUMERIC_COLUMNS = [
@@ -102,12 +115,58 @@ def convert_numbers(data, numeric_columns, dataset_name):
                 "unexpected non-numeric values."
             ) from error
 
+
+# STEP 5: Apply the notebook's identifier-formatting convention.
+# Missing required identifiers stop the run for review.
+def clean_identifier(series):
+    cleaned = (
+        series.astype("string")
+        .str.strip()
+        .str.upper()
+        .replace({
+            "": pd.NA,
+            "NAN": pd.NA,
+            "NONE": pd.NA,
+        })
+    )
+
+    if cleaned.isna().any():
+        raise ValueError(
+            f"{series.name}: missing required identifiers."
+        )
+
+    return cleaned
+
+
+# Keep ABNs as text and pad to 11 digits.
+# Accept an integer-style '.0' suffix without converting through floats.
+def clean_abn(series):
+    cleaned = clean_identifier(series).str.replace(
+        r"\.0+$",
+        "",
+        regex=True,
+    )
+
+    invalid = ~cleaned.str.fullmatch(
+        r"[0-9]{1,11}",
+        na=False,
+    )
+
+    if invalid.any():
+        examples = series.loc[invalid].head(5).tolist()
+        raise ValueError(
+            f"{series.name}: invalid ABNs: {examples}"
+        )
+
+    return cleaned.str.zfill(11)
+
 # Apply the initial transformations to copies.
 # Preserve all source rows, columns, identifiers and names.
 def prepare_historical_data(historical_performance, historical_saa):
     performance = historical_performance.copy()
     saa = historical_saa.copy()
 
+    # Validate the required source columns.
     check_columns(
         performance,
         PERFORMANCE_REQUIRED_COLUMNS,
@@ -119,11 +178,13 @@ def prepare_historical_data(historical_performance, historical_saa):
         "historical_saa",
     )
 
+    # Convert reporting dates before chronological sorting.
     performance["period_end_date"] = convert_dates(
         performance["period_end_date"]
     )
     saa["time_key"] = convert_dates(saa["time_key"])
 
+    # Convert numerical fields using the existing helper.
     convert_numbers(
         performance,
         PERFORMANCE_NUMERIC_COLUMNS,
@@ -135,6 +196,42 @@ def prepare_historical_data(historical_performance, historical_saa):
         "historical_saa",
     )
 
-    print("Initial column, date and numeric checks passed.")
+    # Standardise the join identifiers consistently across both sources.
+    performance["rse_abn"] = clean_abn(performance["rse_abn"])
+    saa["rse_abn"] = clean_abn(saa["rse_abn"])
+
+    for column in ENTITY_KEYS[1:]:
+        performance[column] = clean_identifier(
+            performance[column]
+        )
+
+    saa["investment_option_identifier"] = clean_identifier(
+        saa["investment_option_identifier"]
+    )
+
+    # Group histories by entity, with dates ascending within each entity.
+    # Repeated fee arrangements and SAA asset rows remain at this stage.
+    performance = (
+        performance
+        .sort_values(
+            ENTITY_KEYS + ["period_end_date"],
+            kind="stable",
+        )
+        .reset_index(drop=True)
+    )
+
+    saa = (
+        saa
+        .sort_values(
+            SAA_ENTITY_KEYS + ["time_key"],
+            kind="stable",
+        )
+        .reset_index(drop=True)
+    )
+
+    print(
+        "Initial preparation passed: columns, dates, numbers, "
+        "identifiers and sorting."
+    )
 
     return performance, saa

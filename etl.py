@@ -85,6 +85,12 @@ def main() -> None:
     historical_performance = load_csv(historical_performance_path)
     historical_saa = load_csv(historical_saa_path)
 
+    # Apply the initial transformations defined in transform.py.
+    historical_performance, historical_saa = prepare_historical_data(
+        historical_performance,
+        historical_saa,
+    )
+
     # Basic source checks before adding the column/date validation step.
     print("Both historical datasets were loaded successfully.")
     print(f"Performance observations: {len(historical_performance):,}")
