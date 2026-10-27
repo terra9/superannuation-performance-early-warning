@@ -1,7 +1,12 @@
 import argparse
 from pathlib import Path
 import pandas as pd
-from transform import prepare_historical_data
+from transform import (
+    prepare_historical_data,
+    aggregate_saa_allocations,
+    add_saa_domicile_and_currency,
+    add_strategic_growth_allocation,
+)
 
 
 # Locate the project folder containing this script.
@@ -95,7 +100,23 @@ def main() -> None:
     print("Both historical datasets were loaded successfully.")
     print(f"Performance observations: {len(historical_performance):,}")
     print(f"SAA observations: {len(historical_saa):,}")
+    
+    # Aggregate the prepared SAA rows to option-quarter sector allocations.
+    option_period_saa_features = aggregate_saa_allocations(
+        historical_saa
+    )
 
+    # Extend the sector-allocation table with domicile and currency fields.
+    option_period_saa_features = add_saa_domicile_and_currency(
+        option_period_saa_features,
+        historical_saa,
+    )
+
+    # Add strategic growth allocation using the established notebook weights.
+    option_period_saa_features = add_strategic_growth_allocation(
+        option_period_saa_features,
+        historical_saa,
+    )
 
 # ------------ TRANSFORM ---------------------------
 
