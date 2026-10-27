@@ -117,7 +117,7 @@ def convert_numbers(data, numeric_columns, dataset_name):
             ) from error
 
 
-# STEP 5: Apply the notebook's identifier-formatting convention.
+# Apply the notebook's identifier-formatting convention.
 # Missing required identifiers stop the run for review.
 def clean_identifier(series):
     cleaned = (
@@ -409,7 +409,7 @@ def add_saa_domicile_and_currency(
     option_period_saa_features,
     historical_saa,
 ):
-    # Use the prepared SAA data and the allocation table from Step 8.
+    # Use the prepared SAA data and the allocation table from previous steps.
     option_period_keys = SAA_ENTITY_KEYS + ["time_key"]
     allocation_column = "InvestmentBenchmarkAllocationPercent"
 
@@ -729,3 +729,643 @@ def add_strategic_growth_allocation(
     )
 
     return features
+
+
+# Add the final currency-hedging fields.
+def add_currency_hedging_features(
+    option_period_saa_features,
+    historical_saa,
+):
+    option_period_keys = SAA_ENTITY_KEYS + ["time_key"]
+    allocation_column = "InvestmentBenchmarkAllocationPercent"
+    hedging_column = "InvestmentCurrencyHedgingRatioPercent"
+
+    check_columns(
+        historical_saa,
+        SAA_REQUIRED_COLUMNS,
+        "historical_saa",
+    )
+    check_columns(
+        option_period_saa_features,
+        option_period_keys + ["growth_allocation_missing"],
+        "option_period_saa_features",
+    )
+
+    # Apply the notebook's domicile rule across all SAA rows.
+    # Qualifying Currency Exposure rows are included here.
+    domicile = (
+        historical_saa["ConsolidatedDomicileType"]
+        .astype("string")
+        .str.strip()
+        .str.casefold()
+    )
+
+    applicable = domicile.str.contains(
+        r"international|not specified",
+        na=False,
+    )
+
+    positive_applicable = (
+        applicable
+        & historical_saa[allocation_column].gt(0)
+    )
+
+    valid = (
+        positive_applicable
+        & historical_saa[hedging_column].between(0, 1)
+    )
+    valid_rows = historical_saa.loc[valid].copy()
+
+    # Round only for distinct counts; retain original ratios for weighting.
+    valid_rows["hedging_ratio_rounded"] = (
+        valid_rows[hedging_column].round(6)
+    )
+    valid_rows["weighted_component"] = (
+        valid_rows[hedging_column]
+        * valid_rows[allocation_column]
+    )
+
+    hedging = (
+        valid_rows
+        .groupby(option_period_keys, as_index=False)
+        .agg(
+            weighted_numerator=("weighted_component", "sum"),
+            valid_allocation=(allocation_column, "sum"),
+            currency_hedging_distinct_ratios=(
+                "hedging_ratio_rounded",
+                "nunique",
+            ),
+        )
+    )
+
+    hedging["weighted_currency_hedging_ratio"] = (
+        hedging["weighted_numerator"]
+        / hedging["valid_allocation"]
+    )
+
+    # Coverage includes positive applicable allocations regardless of ratio validity.
+    coverage = (
+        historical_saa.loc[positive_applicable]
+        .groupby(option_period_keys, as_index=False)
+        .agg(
+            currency_hedging_applicable_allocation=(
+                allocation_column,
+                lambda values: values.sum(min_count=1),
+            )
+        )
+    )
+
+    # Surface groups affected by the notebook's valid-ratio matching limitation.
+    no_valid_ratio_count = len(coverage) - len(hedging)
+
+    if no_valid_ratio_count:
+        print(
+            f"Review {no_valid_ratio_count:,} option-quarters: "
+            "positive applicable allocations have no valid hedging ratio. "
+            "Notebook matching behaviour is retained; do not interpret "
+            "an unmatched record as proof of no exposure."
+        )
+
+    # Attach coverage using the same valid-ratio population as the notebook.
+    hedging = hedging.merge(
+        coverage,
+        on=option_period_keys,
+        how="left",
+        validate="one_to_one",
+    )
+
+    hedging_columns = option_period_keys + [
+        "weighted_currency_hedging_ratio",
+        "currency_hedging_applicable_allocation",
+        "currency_hedging_distinct_ratios",
+    ]
+
+    features = (
+        option_period_saa_features.copy()
+        .merge(
+            hedging[hedging_columns],
+            on=option_period_keys,
+            how="left",
+            validate="one_to_one",
+            indicator="_hedging_merge",
+        )
+    )
+
+    # Reproduce the nullable applicability flag from the matching result.
+    matched = features["_hedging_merge"].eq("both")
+
+    observed_saa = (
+        features["growth_allocation_missing"]
+        .astype("boolean")
+        .eq(False)
+        .fillna(False)
+    )
+
+    unmatched_observed_saa = (
+        features["_hedging_merge"].eq("left_only")
+        & observed_saa
+    )
+
+    features["has_applicable_hedging_allocation"] = pd.Series(
+        pd.NA,
+        index=features.index,
+        dtype="boolean",
+    )
+
+    features.loc[
+        matched, "has_applicable_hedging_allocation"
+    ] = True
+
+    features.loc[
+        unmatched_observed_saa,
+        "has_applicable_hedging_allocation",
+    ] = False
+
+    features.loc[
+        unmatched_observed_saa,
+        "currency_hedging_applicable_allocation",
+    ] = 0
+
+    # Preserve the notebook's hedging-state definitions.
+    ratio = features["weighted_currency_hedging_ratio"]
+
+    features["currency_hedging_fully_unhedged"] = (
+        ratio.notna() & np.isclose(ratio, 0)
+    )
+    features["currency_hedging_fully_hedged"] = (
+        ratio.notna() & np.isclose(ratio, 1)
+    )
+    features["currency_hedging_partial"] = (
+        ratio.notna() & ratio.gt(0) & ratio.lt(1)
+    )
+
+    features["currency_hedging_distinct_ratios"] = (
+        features["currency_hedging_distinct_ratios"]
+        .astype("Int64")
+    )
+
+    # Remove the temporary matching indicator and retain chronological order.
+    features = (
+        features
+        .drop(columns="_hedging_merge")
+        .sort_values(option_period_keys, kind="stable")
+        .reset_index(drop=True)
+    )
+
+    print(
+        f"SAA hedging fields added: "
+        f"{len(features):,} option-quarters, "
+        f"{len(features.columns):,} columns."
+    )
+
+    return features
+
+# Add CSV-derived performance-history and volatility fields.
+def add_performance_history_and_volatility(historical_performance):
+    metric_5y = (
+        "return_investment_five_year_volatility_comparison_percent"
+    )
+    metric_10y = (
+        "return_investment_ten_year_volatility_comparison_percent"
+    )
+
+    check_columns(
+        historical_performance,
+        ENTITY_KEYS + ["period_end_date", metric_5y, metric_10y],
+        "historical_performance",
+    )
+
+    performance = historical_performance.copy()
+
+    # Describe each entity's history in the loaded source snapshot.
+    # Record count includes fee-arrangement rows, matching the notebook.
+    grouped_dates = (
+        performance
+        .groupby(ENTITY_KEYS, dropna=False)["period_end_date"]
+    )
+
+    performance["first_historical_period"] = (
+        grouped_dates.transform("min")
+    )
+    performance["last_historical_period"] = (
+        grouped_dates.transform("max")
+    )
+    performance["historical_record_count"] = (
+        grouped_dates.transform("size")
+    )
+
+    # Reproduce the observed-history anniversary calculation.
+    performance["historical_ten_year_anniversary"] = (
+        performance["first_historical_period"]
+        + pd.DateOffset(years=10)
+    )
+    performance["has_ten_years_observed_history"] = (
+        performance["period_end_date"].ge(
+            performance["historical_ten_year_anniversary"]
+        )
+    )
+
+    # Preserve the notebook's order: create missingness flags first.
+    performance["volatility_10y_missing"] = (
+        performance[metric_10y].isna().astype("int8")
+    )
+    performance["volatility_5y_missing"] = (
+        performance[metric_5y].isna().astype("int8")
+    )
+
+    # Apply the existing ten-year infinity cleanup.
+    performance[metric_10y] = performance[metric_10y].replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    # Preserve the notebook's column names and reported finite values.
+    performance[f"{metric_10y}_raw"] = performance[metric_10y]
+    performance[f"{metric_10y}_clean"] = performance[metric_10y]
+
+    performance["volatility_10y_quality_status"] = "reported"
+
+    # Retain values above 0.30 and flag them rather than clipping them.
+    performance["volatility_10y_high_flag"] = (
+        performance[metric_10y].gt(0.30)
+    )
+
+    print(
+        f"Performance history and volatility fields added: "
+        f"{len(performance):,} rows, "
+        f"{len(performance.columns):,} columns."
+    )
+
+    return performance
+
+# Attach SAA features without removing performance records.
+def merge_performance_and_saa(hist_enriched, option_period_saa_features):
+    saa_merge_keys = [
+        "rse_abn",
+        "abn_investment_option_identifier",
+        "period_end_date",
+    ]
+
+    check_columns(
+        hist_enriched,
+        ENTITY_KEYS + ["period_end_date"],
+        "hist_enriched",
+    )
+    check_columns(
+        option_period_saa_features,
+        SAA_ENTITY_KEYS + ["time_key", "weighted_currency_hedging_ratio"],
+        "option_period_saa_features",
+    )
+
+    # Rename SAA keys to match performance; preserve the original SAA table.
+    saa_prepared = option_period_saa_features.rename(
+        columns={
+            "investment_option_identifier": "abn_investment_option_identifier",
+            "time_key": "period_end_date",
+        }
+    ).copy()
+
+    # Stop accidental repeated joins that would create ambiguous duplicate columns.
+    reserved_columns = [
+        "_saa_merge",
+        "saa_matched",
+        "has_applicable_international_allocation",
+    ]
+    overlap = sorted(
+        set(hist_enriched.columns)
+        & (
+            (set(saa_prepared.columns) - set(saa_merge_keys))
+            | set(reserved_columns)
+        )
+    )
+    if overlap:
+        raise ValueError(
+            f"hist_enriched already contains SAA columns: {overlap}"
+        )
+
+    # Several performance representations may share one SAA option-quarter.
+    # A left join retains performance rows without matching SAA.
+    merged = hist_enriched.merge(
+        saa_prepared,
+        on=saa_merge_keys,
+        how="left",
+        validate="many_to_one",
+        indicator="_saa_merge",
+        sort=False,
+    )
+
+    # Preserve two diagnostics from the notebook's earlier hedging join.
+    # These describe valid hedging matches.
+    # The separate _saa_merge column describes the full SAA match.
+    merged["saa_matched"] = (
+        merged["weighted_currency_hedging_ratio"].notna()
+    )
+    merged["has_applicable_international_allocation"] = pd.Series(
+        True,
+        index=merged.index,
+        dtype="object",
+    ).where(merged["saa_matched"])
+
+    print(
+        f"SAA join: {len(merged):,} performance rows retained; "
+        f"{merged['_saa_merge'].eq('both').sum():,} matched rows."
+    )
+    return merged
+
+
+# Collapse fee arrangements after checking all other fields agree.
+def build_model_base(hist_enriched_saa):
+    model_grain = ENTITY_KEYS + ["period_end_date"]
+    fee_column = "fees_and_costs_arrangement_identifier"
+
+    check_columns(
+        hist_enriched_saa,
+        model_grain + [fee_column],
+        "hist_enriched_saa",
+    )
+    if "fee_arrangement_count" in hist_enriched_saa.columns:
+        raise ValueError(
+            "fee_arrangement_count already exists; use arrangement-level data."
+        )
+
+    # Check every non-fee column, including metadata and missing values.
+    # Separate products and menus remain separate modelling observations.
+    other_columns = [
+        column
+        for column in hist_enriched_saa.columns
+        if column not in model_grain + [fee_column]
+    ]
+    consistency = (
+        hist_enriched_saa
+        .groupby(model_grain, dropna=False)[other_columns]
+        .nunique(dropna=False)
+    )
+
+    varying_columns = consistency.columns[
+        consistency.gt(1).any()
+    ].tolist()
+
+    if varying_columns:
+        raise ValueError(
+            "Cannot collapse fee arrangements: conflicting non-fee columns "
+            f"within the modelling grain: {varying_columns}. "
+            "Review these records first."
+        )
+
+    # Count distinct arrangements, matching the notebook's treatment of missing IDs.
+    fee_counts = (
+        hist_enriched_saa
+        .groupby(model_grain, dropna=False)[fee_column]
+        .nunique(dropna=False)
+        .rename("fee_arrangement_count")
+        .reset_index()
+    )
+
+    # Retain one identical record per modelling key and attach its fee count.
+    model_base = (
+        hist_enriched_saa
+        .drop(columns=fee_column)
+        .drop_duplicates(subset=model_grain)
+        .merge(
+            fee_counts,
+            on=model_grain,
+            how="left",
+            validate="one_to_one",
+        )
+        .reset_index(drop=True)
+    )
+
+    print(
+        f"Modelling base: {len(hist_enriched_saa):,} arrangement rows -> "
+        f"{len(model_base):,} product-menu-option-quarter rows."
+    )
+    return model_base
+
+# Select MySuper using the audit notebook's exact rule.
+def select_mysuper_population(hist_model_base):
+    model_grain = ENTITY_KEYS + ["period_end_date"]
+
+    check_columns(
+        hist_model_base,
+        model_grain + ["product_type", "product_phase"],
+        "hist_model_base",
+    )
+
+    # Create a separate MySuper dataframe, preserving every existing column.
+    # Missing predictors or unavailable future targets do not remove rows here.
+    mysuper = (
+        hist_model_base.loc[
+            hist_model_base["product_type"].eq("MySuper Product")
+        ]
+        .copy()
+        .reset_index(drop=True)
+    )
+
+    # Stop if the expected label is absent or modelling keys are duplicated.
+    if mysuper.empty:
+        raise ValueError(
+            "No 'MySuper Product' rows found. "
+            "Check the source product_type labels."
+        )
+
+    if mysuper.duplicated(subset=model_grain).any():
+        raise ValueError(
+            "MySuper records are duplicated at the established modelling grain."
+        )
+
+    # The notebook's MySuper population was entirely Accumulation.
+    # Check that assumption for each edition without silently filtering phases.
+    if not mysuper["product_phase"].eq("Accumulation").fillna(False).all():
+        raise ValueError(
+            "MySuper includes missing or non-Accumulation product phases. "
+            "Review the population before continuing."
+        )
+
+    print(
+        f"MySuper population: {len(mysuper):,} rows retained from "
+        f"{len(hist_model_base):,} modelling rows; all are Accumulation."
+    )
+
+    return mysuper
+
+# STEP 16: Calculate each representation's next-four-quarter return.
+def add_future_4q_returns(hist_model_mysuper):
+    return_column = "return_measurement_comparison_percent"
+    model_grain = ENTITY_KEYS + ["period_end_date"]
+
+    check_columns(
+        hist_model_mysuper,
+        model_grain + [return_column],
+        "hist_model_mysuper",
+    )
+    if hist_model_mysuper.duplicated(subset=model_grain).any():
+        raise ValueError(
+            "Future returns require one row per modelling key."
+        )
+
+    # Sort within each original product/menu/option history before shifting.
+    target_data = (
+        hist_model_mysuper.copy()
+        .sort_values(model_grain, kind="stable")
+        .reset_index(drop=True)
+    )
+    grouped = target_data.groupby(ENTITY_KEYS, dropna=False)
+    current_quarter = target_data["period_end_date"].dt.to_period("Q")
+    consecutive = pd.Series(True, index=target_data.index)
+
+    # Confirm that shifted rows really represent the next four calendar quarters.
+    for i in range(1, 5):
+        target_data[f"return_t_plus_{i}"] = (
+            grouped[return_column].shift(-i)
+        )
+        target_data[f"date_t_plus_{i}"] = (
+            grouped["period_end_date"].shift(-i)
+        )
+
+        consecutive &= (
+            target_data[f"date_t_plus_{i}"].dt.to_period("Q")
+            == current_quarter + i
+        )
+
+    # Require all four future returns; exclude the current quarter's return.
+    return_columns = [f"return_t_plus_{i}" for i in range(1, 5)]
+    date_columns = [f"date_t_plus_{i}" for i in range(1, 5)]
+
+    complete_returns = target_data[return_columns].notna().all(axis=1)
+    available = consecutive & complete_returns
+
+    target_data["future_4q_target_available"] = available
+    target_data["future_4q_cumulative_return"] = np.nan
+
+    target_data.loc[available, "future_4q_cumulative_return"] = (
+        (1 + target_data.loc[available, return_columns]).prod(axis=1) - 1
+    )
+
+    # Record why this representation cannot supply its own future outcome.
+    dates_missing = target_data[date_columns].isna().any(axis=1)
+
+    target_data["future_4q_unavailable_reason"] = np.select(
+        [dates_missing, ~consecutive, ~complete_returns],
+        [
+            "insufficient_future_history",
+            "nonconsecutive_quarters",
+            "missing_future_return",
+        ],
+        default="available",
+    )
+
+    print(
+        f"Representation outcomes: {available.sum():,} available; "
+        f"{(~available).sum():,} unavailable. "
+        f"All {len(target_data):,} rows retained."
+    )
+
+    return target_data
+
+
+# Construct peer targets using distinct investment options per quarter.
+def add_peer_relative_target(hist_model_mysuper_target):
+    peer_keys = [
+        "rse_abn",
+        "abn_investment_option_identifier",
+        "period_end_date",
+    ]
+    return_column = "future_4q_cumulative_return"
+
+    check_columns(
+        hist_model_mysuper_target,
+        peer_keys + [return_column, "future_4q_target_available"],
+        "hist_model_mysuper_target",
+    )
+
+    # Only complete future windows can supply peer returns.
+    available = hist_model_mysuper_target[
+        "future_4q_target_available"
+    ].eq(True)
+
+    peer_returns = hist_model_mysuper_target.loc[
+        available,
+        peer_keys + [return_column],
+    ].copy()
+
+    # Verify agreement before retaining one return per option-quarter.
+    consistency = (
+        peer_returns
+        .groupby(peer_keys)[return_column]
+        .nunique(dropna=False)
+    )
+
+    if consistency.gt(1).any():
+        raise ValueError(
+            "Conflicting future returns across representations of the same "
+            "investment option-quarter. "
+            "Review before constructing peer targets."
+        )
+
+    peer_returns = peer_returns.drop_duplicates(subset=peer_keys)
+
+    # Each distinct option has one vote in its quarter's peer threshold.
+    peer_returns["future_4q_q25_threshold"] = (
+        peer_returns
+        .groupby("period_end_date")[return_column]
+        .transform(lambda values: values.quantile(0.25))
+    )
+
+    # Include ties at the threshold, matching the notebook.
+    peer_returns["future_4q_bottom_quartile"] = (
+        peer_returns[return_column]
+        <= peer_returns["future_4q_q25_threshold"]
+    )
+
+    # Preserve representation-level outcomes separately from option-level labels.
+    target_data = hist_model_mysuper_target.rename(
+        columns={
+            "future_4q_target_available":
+                "future_4q_target_available_representation",
+            return_column:
+                "future_4q_cumulative_return_representation",
+        }
+    ).merge(
+        peer_returns[
+            peer_keys
+            + [
+                "future_4q_q25_threshold",
+                "future_4q_bottom_quartile",
+            ]
+        ],
+        on=peer_keys,
+        how="left",
+        validate="many_to_one",
+        sort=False,
+    )
+
+    # A nullable Boolean preserves missing labels for unavailable outcomes.
+    target_data["future_4q_bottom_quartile"] = (
+        target_data["future_4q_bottom_quartile"].astype("boolean")
+    )
+    target_data["future_4q_target_available_option"] = (
+        target_data["future_4q_bottom_quartile"].notna()
+    )
+
+    # Record the outcome-window end date for temporal purging.
+    target_data["target_end_date"] = (
+        (target_data["period_end_date"].dt.to_period("Q") + 4)
+        .dt.to_timestamp(how="end")
+        .dt.normalize()
+    )
+
+    option_available = target_data["future_4q_target_available_option"]
+    target_data.loc[~option_available, "target_end_date"] = pd.NaT
+
+    gained = (
+        option_available
+        & ~target_data["future_4q_target_available_representation"]
+    ).sum()
+
+    print(
+        f"Option-level targets: {option_available.sum():,} available; "
+        f"{(~option_available).sum():,} unavailable; "
+        f"{gained:,} gained through another representation of the same option."
+    )
+
+    return target_data

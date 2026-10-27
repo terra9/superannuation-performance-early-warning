@@ -6,8 +6,12 @@ from transform import (
     aggregate_saa_allocations,
     add_saa_domicile_and_currency,
     add_strategic_growth_allocation,
+    add_currency_hedging_features,
+    add_performance_history_and_volatility,
 )
-
+from transform import merge_performance_and_saa, build_model_base
+from transform import select_mysuper_population
+from transform import add_future_4q_returns, add_peer_relative_target
 
 # Locate the project folder containing this script.
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -100,6 +104,8 @@ def main() -> None:
     print("Both historical datasets were loaded successfully.")
     print(f"Performance observations: {len(historical_performance):,}")
     print(f"SAA observations: {len(historical_saa):,}")
+
+    # ------------ TRANSFORM ---------------------------
     
     # Aggregate the prepared SAA rows to option-quarter sector allocations.
     option_period_saa_features = aggregate_saa_allocations(
@@ -118,8 +124,39 @@ def main() -> None:
         historical_saa,
     )
 
-# ------------ TRANSFORM ---------------------------
+    # Complete the SAA table with the established hedging features.
+    option_period_saa_features = add_currency_hedging_features(
+        option_period_saa_features,
+        historical_saa,
+    )
 
-# --------------------------------------------------
+    # Prepare the performance table for its later join with SAA.
+    hist_enriched = add_performance_history_and_volatility(
+        historical_performance
+    )
+
+    # Join the completed SAA features to the enriched performance history.
+    hist_enriched_saa = merge_performance_and_saa(
+        hist_enriched,
+        option_period_saa_features,
+    )
+
+    # Collapse repeated fee arrangements to the established modelling grain.
+    hist_model_base = build_model_base(hist_enriched_saa)
+
+    # Select MySuper while retaining the complete modelling base separately.
+    hist_model_mysuper = select_mysuper_population(hist_model_base)
+
+    # Calculate future returns within each original representation.
+    hist_model_mysuper_target = add_future_4q_returns(
+        hist_model_mysuper
+    )
+
+    # Construct distinct-option peer targets and option-level availability.
+    hist_model_mysuper_target_peer = add_peer_relative_target(
+        hist_model_mysuper_target
+    )
+
+    # --------------------------------------------------
 if __name__ == "__main__":
     main()
