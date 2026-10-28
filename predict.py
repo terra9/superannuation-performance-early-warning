@@ -107,7 +107,7 @@ def get_saa_detail(raw_dir, latest, run_id):
 # Load the existing fitted model and check its fixed feature order/threshold.
 def create_prediction_run(project_root, edition, model_path=None, raw_dir=None, publication_date=None):
     project_root = Path(project_root)
-    model_path = Path(model_path) if model_path else project_root / "outputs" / "final_rf_reduced29_t035" / "model.joblib"
+    model_path = Path(model_path) if model_path else project_root / "models" / "rf_reduced29_t035_v1" / "model.joblib"
     data_path = project_root / "data" / "processed" / f"hist_model_mysuper_features_{edition}.parquet"
     for label, path in [("Prepared data", data_path), ("Saved model", model_path)]:
         if not path.is_file():
@@ -127,7 +127,7 @@ def create_prediction_run(project_root, edition, model_path=None, raw_dir=None, 
     # A fingerprint identifies the saved model; no separate model registry is created.
     model_version = hashlib.sha256(model_bytes).hexdigest()
 
-    # STEP 4: Select the latest quarter and score only the saved 29 predictors.
+    # Select the latest quarter and score only the saved 29 predictors.
     data = pd.read_parquet(data_path)
     check_columns(data, MODEL_GRAIN + features, "Prepared data")
     if data.empty:
@@ -150,7 +150,7 @@ def create_prediction_run(project_root, edition, model_path=None, raw_dir=None, 
     positive_column = int(np.flatnonzero(model.classes_ == 1)[0])
     probabilities = model.predict_proba(x)[:, positive_column]
 
-    # STEP 5: Prepare predictions, descriptive fields, and the exact scored inputs.
+    # Prepare predictions, descriptive fields, and the exact scored inputs.
     generated_at = datetime.now(timezone.utc)
     run_id = generated_at.strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid4().hex[:8]
     forecast_start = (origin.to_period("Q") + 1).start_time.normalize()
