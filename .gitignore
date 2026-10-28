@@ -40,3 +40,6 @@ Thumbs.db
 desktop.ini
 *.swp
 *~
+
+# Prediction documentation
+PREDICTION_ARCHIVE.md
