@@ -41,5 +41,6 @@ desktop.ini
 *.swp
 *~
 
-# Prediction documentation
+# documentation
 PREDICTION_ARCHIVE.md
+MONITORING.md
