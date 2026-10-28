@@ -1,0 +1,26 @@
+{
+  "status": "complete",
+  "monitoring_id": "20261028T100052899377Z_c7509bdf",
+  "evaluated_at_utc": "2026-10-28T10:00:52.899377+00:00",
+  "outcome_edition": "2026-03",
+  "outcome_source": "D:\\STUDY & WORK\\STUDY\\MASTER\\Monash University\\Projects\\SuperAnnuation\\data\\processed\\hist_model_mysuper_features_2026-03.parquet",
+  "outcome_source_sha256": "5c3e8965329d26844e0b5b39ae160f4f686d0bda1ba4cece7795a43434da29dc",
+  "label_coverage_end": "2026-03-31",
+  "metric_grain": "modelling_rows",
+  "drift_reference": "previous_available_origin_same_model",
+  "run_ids": [
+    "20261028T081802738546Z_8dbda711",
+    "20261028T090559526516Z_a0db59d1",
+    "20261028T091201415233Z_d9216fbd"
+  ],
+  "skipped_folders": [],
+  "review_limits": {
+    "probability_distance": 0.05,
+    "warning_rate_change": 0.1,
+    "missing_share_change": 0.1,
+    "scaled_feature_distance": 0.5
+  },
+  "review_limits_are_heuristics": true,
+  "automatic_retraining": false,
+  "point_in_time_availability_verified": false
+}
